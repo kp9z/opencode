@@ -45,14 +45,148 @@ User types prompt in TUI
 ```
 
 **Key files (read in this order):**
-1. `packages/opencode/src/session/index.ts` — `appendMessage()`
-2. `packages/opencode/src/session/llm.ts` — `LLM.stream()`
-3. `packages/opencode/src/session/processor.ts` — the main processing loop
-4. `packages/opencode/src/session/message-v2.ts` — all message/part types
-5. `packages/opencode/src/tool/tool.ts` — Tool.Info interface
-6. `packages/opencode/src/tool/registry.ts` — how tools are registered
+
+### `packages/opencode/src/cli/cmd/tui/thread.ts`
+Entry point for the TUI command. Spawns a single long-lived Bun Worker at startup (not per message).
+Creates an RPC client — a thin wrapper over `postMessage`/`onmessage` that makes worker calls look like async function calls (`client.call("fetch", ...)`). All HTTP requests from the TUI go through this RPC client instead of a real TCP socket.
+
+### `packages/opencode/src/cli/cmd/tui/worker.ts`
+Runs inside the Bun Worker thread. Boots the Hono HTTP server, SQLite, session logic, and all agent infrastructure. Subscribes to the internal event bus and forwards events back to the main thread via `Rpc.emit("global.event", event)` so the TUI can re-render.
+
+### `packages/opencode/src/session/prompt.ts`
+The orchestration layer. Contains two key functions:
+- **`prompt()`** — creates the user message in DB, then calls `loop()`
+- **`loop()`** — the outer `while(true)` loop (line 297). Each iteration: finds the last user message, checks if done, handles pending subtasks/compaction, builds the system prompt, resolves tools, creates a `SessionProcessor`, and calls `processor.process()`. Breaks when processor returns `"stop"` or finish reason is not `"tool-calls"`.
+- **`resolveTools()`** — assembles the full tool list from three sources: `ToolRegistry.tools()` (built-ins), `MCP.tools()` (MCP servers), and LSP tools. Builds a `Tool.Context` closure per tool that wires up permission checks and part updates.
+- **`insertReminders()`** — injects synthetic text parts into the last user message on each loop iteration: `plan.txt` when in plan mode, `build-switch.txt` when switching plan → build.
+
+### `packages/opencode/src/session/index.ts`
+Pure data layer for sessions. Key functions:
+- **`updateMessage()`** — upserts a message row and publishes `MessageV2.Event.Updated` to the bus
+- **`updatePart()`** — upserts a part row and publishes `MessageV2.Event.PartUpdated` (full DB write)
+- **`updatePartDelta()`** — publishes `MessageV2.Event.PartDelta` only (no DB write — used for streaming text deltas to avoid write amplification)
+- **`getUsage()`** — normalizes token counts and calculates cost across providers (Anthropic counts cached tokens differently from OpenAI/OpenRouter)
+- **`messages()`** — loads all messages+parts for a session in order
+
+### `packages/opencode/src/session/llm.ts`
+Thin wrapper around Vercel AI SDK's `streamText()`. Key responsibilities:
+- **`stream()`** — resolves the language model adapter, assembles the system prompt array (agent prompt or provider-specific prompt + environment + custom), merges provider/agent/variant options, calls `streamText()` with the tool list and message history
+- **`resolveTools()`** — final permission filter: removes any tool disabled by the agent's ruleset before the LLM call. The LLM never sees disabled tools.
+- System prompt is assembled as a 2-part array (header + rest) to maximize Anthropic prompt caching
+
+**System prompt assembly (final order sent to LLM):**
+```
+1. agent.prompt  OR  SystemPrompt.provider(model)   ← who you are + how to behave
+2. SystemPrompt.environment(model)                  ← working dir, platform, date
+3. SystemPrompt.skills(agent)                       ← available slash commands
+4. InstructionPrompt.system()                       ← CLAUDE.md / custom instructions
+```
+
+Parts 2-4 are assembled in `prompt.ts:656` and passed as `system[]` into `LLM.stream()`.
+Part 1 is prepended inside `llm.ts:73`.
+
+**Provider-specific prompts (`session/system.ts:provider()`):**
+Each model family gets a different base prompt because they respond to instructions differently:
+
+| Model pattern | Prompt file | Style |
+|---|---|---|
+| `claude` | `session/prompt/anthropic.txt` | Conversational, nuanced, TodoWrite guidance |
+| `gpt-` / `o1` / `o3` | `session/prompt/beast.txt` | Aggressive repetition ("KEEP GOING", "DO NOT STOP") — fights GPT's tendency to stop early |
+| `gpt-5` (Codex OAuth) | `session/prompt/codex_header.txt` | Sent via `options.instructions` field, not system prompt |
+| `gemini-` | `session/prompt/gemini.txt` | Gemini-tuned |
+| `trinity` | `session/prompt/trinity.txt` | Trinity-tuned |
+| everything else | `session/prompt/qwen.txt` | Anthropic-style but without TodoWrite |
+
+`build` and `plan` agents have **no `agent.prompt`** — they fall through to `SystemPrompt.provider(model)`.
+Subagents (`explore`, `compaction`, `title`, `summary`) have their own `agent.prompt` and skip `provider()` entirely.
+
+**Tool definitions are NOT in the system prompt.** Each tool's `description` and `inputSchema` are passed directly to `streamText({ tools })` via the Vercel AI SDK. The LLM learns what tools exist from the tool definitions per-call, not from the system prompt. The only exception is skills — those are listed in the system prompt via `SystemPrompt.skills()`.
+
+### `packages/opencode/src/session/processor.ts`
+The inner loop — handles one LLM round-trip. Key responsibilities:
+- **`create()`** — factory that holds per-response state: `toolcalls` map (callID → ToolPart), `blocked` flag, `needsCompaction` flag
+- **`process()`** — inner `while(true)` loop (line 50) that iterates `stream.fullStream`. Dispatches on event type:
+  - `text-start/delta/end` — creates/streams/finalizes a `TextPart`
+  - `reasoning-start/delta/end` — same pattern for reasoning/thinking tokens
+  - `tool-input-start` → creates `ToolPart` with `status: "pending"`
+  - `tool-call` → updates to `status: "running"`, runs doom loop check (same tool + same args 3× in last 3 parts → asks permission)
+  - `tool-result` → updates to `status: "completed"` with output
+  - `tool-error` → updates to `status: "error"`, sets `blocked=true` if user denied
+  - `start-step` → takes filesystem snapshot via `Snapshot.track()`
+  - `finish-step` → calculates cost/tokens, checks context overflow → sets `needsCompaction`
+- Returns `"continue"` | `"stop"` | `"compact"` to the outer loop
+
+### `packages/opencode/src/session/message-v2.ts`
+All message and part type definitions. A session message has a `role` (`user` | `assistant`) and an array of typed parts:
+- `TextPart` — LLM text output
+- `ReasoningPart` — chain-of-thought / thinking tokens
+- `ToolPart` — a tool call with state machine: `pending → running → completed | error`
+- `StepStartPart` / `StepFinishPart` — bookend each LLM round-trip, carry token/cost/snapshot data
+- `PatchPart` — file diff produced after tool execution
+- `FilePart` — user-attached file
+- `SubtaskPart` / `CompactionPart` — pending work items processed by the outer loop
+
+### `packages/opencode/src/tool/tool.ts`
+Defines the `Tool.Info` interface every tool must implement:
+- `id` — tool name (matches permission key)
+- `description` — shown to LLM
+- `parameters` — Zod schema for input validation
+- `execute(args, ctx)` — the tool implementation
+- `Tool.Context` — injected into every tool execution: `sessionID`, `messageID`, `abort` signal, `ask()` (permission check), `metadata()` (update the running ToolPart UI), `messages` (full conversation history)
+
+### `packages/opencode/src/tool/registry.ts`
+Registers all built-in tools and filters them per agent/model. `ToolRegistry.tools(model, agent)` returns only tools compatible with the current model and not disabled by the agent's permission ruleset.
 
 **Key concept:** The processor loop is the heart of the system. It handles streaming events and dispatches tool calls, loops back to the LLM after tool execution, detects doom loops (same tool + args 3x), and compacts context when tokens overflow.
+
+**Agent setup differences (build vs plan):**
+- Both use the same base system prompt (`anthropic.txt` for Claude, `beast.txt` for GPT, etc.) from `session/system.ts`
+- **build**: can use all tools; `plan_enter` allowed; `plan_exit` denied
+- **plan**: `edit`/`write` denied except `.opencode/plans/*.md`; `plan_exit` allowed; `plan_enter` denied
+- On each loop iteration, `insertReminders()` appends a synthetic reminder to the last user message — `plan.txt` ("READ-ONLY, ZERO exceptions") in plan mode, `build-switch.txt` ("you may now make file changes") when switching back
+- Permission ruleset is **hard enforcement** (tools removed from LLM call); reminder text is **soft enforcement** (steers behavior in natural language)
+
+**Tool attachment chain:**
+```
+prompt.ts:resolveTools()
+  → ToolRegistry.tools()     built-in tools
+  → MCP.tools()              MCP server tools
+  → LSP tools                language server tools
+  → passed to processor.process({ tools })
+    → passed to LLM.stream({ tools })
+      → llm.ts:resolveTools()   strips permission-denied tools
+        → streamText({ tools })  LLM sees final filtered list
+```
+
+**How subagents are called (`tool/task.ts`):**
+
+The main agent calls the `task` tool like any other tool. There is no special dispatch — it's a regular tool call that blocks until the child finishes.
+
+```
+LLM emits tool-call: task({ subagent_type: "explore", prompt: "...", description: "..." })
+  → task.ts:execute()
+    → Session.create({ parentID: ctx.sessionID })   creates a child session in DB
+    → SessionPrompt.prompt({                         runs the full loop() for child
+        sessionID: child.id,
+        agent: "explore",
+        model: agent.model ?? parent model,
+        parts: resolvePromptParts(params.prompt),
+      })
+      → child session runs its own while(true) loop to completion
+      → child LLM only sees tools allowed by explore agent's permission ruleset
+    → takes last TextPart from child result
+    → returns string:
+        "task_id: <session_id>\n<task_result>\n{text}\n</task_result>"
+
+  → processor receives tool-result with that string
+  → parent LLM sees it on the next round-trip and continues
+```
+
+**Key constraints on child sessions:**
+- `todowrite: deny`, `todoread: deny` — subagents don't manage the parent's todo list
+- `task: deny` by default — subagents can't spawn further subagents (unless the agent config explicitly has task permission)
+- `task_id` parameter — optional, resumes an existing child session instead of creating a new one
+- Child uses parent's model unless the agent config specifies its own `model`
 
 ---
 
@@ -79,14 +213,108 @@ User types prompt in TUI
 4. Understand `Truncate.output()` — tools auto-truncate large output
 5. Understand permission checks inside tools: `ctx.ask()`
 
-**Built-in tool categories:**
-| Category | Tools |
-|----------|-------|
-| File ops | `read`, `write`, `edit`, `multiedit`, `glob`, `ls` |
-| Search | `grep`, `codesearch`, `websearch`, `webfetch` |
-| Execution | `bash`, `apply_patch` |
-| Management | `task`, `todo`, `plan`, `question`, `skill` |
-| Advanced | `lsp`, `batch` |
+**Built-in tools:**
+
+| Tool | What it does |
+|------|-------------|
+| `bash` | Executes bash commands in a persistent shell session |
+| `read` | Reads file content with optional line offset/limit |
+| `write` | Writes/overwrites a file on disk |
+| `edit` | Exact string replacement in a file (oldString → newString) |
+| `apply_patch` | GPT-model alternative to `edit` — uses Add/Update/Delete patch format |
+| `glob` | Finds files by pattern (e.g. `**/*.ts`), sorted by modification time |
+| `grep` | Searches file contents by regex, optionally filtered by file type |
+| `webfetch` | Fetches a URL and returns content as markdown/text/html |
+| `websearch` | Real-time web search via Exa AI (requires opencode provider or flag) |
+| `codesearch` | Searches code-specific context via Exa Code API — libraries, SDKs, API refs |
+| `task` | Spawns a subagent session to handle a subtask autonomously |
+| `todowrite` | Creates/updates a structured task list to track progress |
+| `plan_exit` | Exits plan mode and signals switch to build agent (experimental flag only) |
+| `question` | Asks the user a question mid-task to clarify requirements or get a decision |
+| `skill` | Loads a skill (SKILL.md + bundled files) into conversation context |
+| `lsp` | Language server integration — hover, definitions, references, diagnostics (experimental flag) |
+| `batch` | Runs 1-25 independent tool calls concurrently to reduce latency (experimental config) |
+| `invalid` | Placeholder that returns an error — catches malformed tool calls from the LLM |
+
+---
+
+## Phase 4b: Plugin & Hook System
+
+**Key files:**
+- `packages/opencode/src/plugin/index.ts` — plugin loader and `Plugin.trigger()`
+- `packages/plugin/src/index.ts` — `Hooks` interface definition
+
+**What a plugin is:**
+A plugin is a function that returns a `Hooks` object. Registered in config via `plugin: ["file:///path/to/plugin.ts"]` or an npm package name. Loaded once at startup per instance.
+
+```ts
+export default async function(input: PluginInput): Promise<Hooks> {
+  return {
+    "tool.execute.before": async (input, output) => {
+      output.args.myExtra = "injected"
+    },
+  }
+}
+```
+
+**How `Plugin.trigger()` works:**
+Called at every hook point in the codebase. Iterates all loaded plugin hooks for that name, passes `output` object to each — plugins mutate it in place. Returns the (possibly modified) output.
+
+```ts
+const params = await Plugin.trigger("chat.params", { sessionID, model }, { temperature: 0.7 })
+// params.temperature may have been modified by a plugin
+```
+
+**Available hooks:**
+
+| Hook | When it fires | What you can modify |
+|---|---|---|
+| `event` | every bus event | observe only |
+| `config` | at startup | — |
+| `tool` | registration | add custom tools |
+| `auth` | auth flow | credentials |
+| `chat.message` | new user message received | message parts |
+| `chat.params` | before every LLM call | temperature, topP, options |
+| `chat.headers` | before every LLM call | HTTP headers |
+| `permission.ask` | permission check | allow/deny/ask decision |
+| `tool.execute.before` | before any tool runs | tool args |
+| `tool.execute.after` | after any tool runs | tool output string |
+| `shell.env` | before bash executes | environment variables |
+| `experimental.chat.system.transform` | system prompt assembly | system prompt array |
+| `experimental.chat.messages.transform` | before LLM call | full message history |
+| `experimental.session.compacting` | before compaction | compaction prompt |
+| `experimental.text.complete` | after LLM text finishes | text content |
+
+**Built-in internal plugins** (always loaded, not via config):
+- `CodexAuthPlugin` — handles OpenAI Codex OAuth
+- `CopilotAuthPlugin` — handles GitHub Copilot auth
+- `GitlabAuthPlugin` — handles GitLab auth
+
+**App lifecycle — when plugins load (`project/bootstrap.ts`):**
+
+Plugins are loaded once per instance via `InstanceBootstrap()`, which is called on the first request to `/session` or `/project`. Not at server startup — lazy, per working directory.
+
+```
+bun dev
+  → worker.ts spawns → Hono server ready
+
+first session/project request
+  → Instance.init() → InstanceBootstrap()
+    → Plugin.init()
+      → load internal plugins (direct imports — Codex, Copilot, Gitlab)
+      → read config.plugin[] list
+      → BunProc.install(pkg, version)   install from npm if needed
+      → import(pluginPath)              dynamic import at runtime
+      → plugin(input)                   call plugin function → get Hooks object
+      → push Hooks into hooks[] array
+      → Bus.subscribeAll → forward all events to hook["event"]
+    → LSP.init(), Format.init(), FileWatcher.init(), VcsService.init()
+
+every subsequent Plugin.trigger() call
+  → iterate in-memory hooks[] array   fast, no re-loading
+```
+
+`Instance.state()` caches the result — plugin loading only happens once per working directory for the lifetime of the process.
 
 ---
 
